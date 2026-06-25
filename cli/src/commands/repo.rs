@@ -151,7 +151,8 @@ async fn cmd_repo_create(
             name,
             visibility: Some(visibility),
         },
-    )?;
+    )?
+    .ok_or_else(|| user_error("repo/create returned an empty response"))?;
 
     writeln!(
         ui.stdout(),
@@ -196,11 +197,15 @@ async fn cmd_repo_delete(
             visibility: None,
         },
     )?;
-    writeln!(
-        ui.stdout(),
-        "deleted {} repository {} (id={}, lifecycle={})",
-        response.scm_type, response.mononoke_repo_name, response.repository_id, response.lifecycle
-    )?;
+    if let Some(response) = response {
+        writeln!(
+            ui.stdout(),
+            "deleted {} repository {} (id={}, lifecycle={})",
+            response.scm_type, response.mononoke_repo_name, response.repository_id, response.lifecycle
+        )?;
+    } else {
+        writeln!(ui.stdout(), "deleted jj repository {owner}/{name}")?;
+    }
     Ok(())
 }
 
@@ -208,7 +213,7 @@ fn lifecycle_request(
     server: &str,
     path: &str,
     request: &RepoLifecycleRequest<'_>,
-) -> Result<RepoLifecycleResponse, CommandError> {
+) -> Result<Option<RepoLifecycleResponse>, CommandError> {
     let token = token_from_env().ok_or_else(|| {
         user_error("missing JJAPI auth token")
             .hinted("Set JJAPI_TOKEN, NCODE_TOKEN, GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN, GH_TOKEN, or GITHUB_TOKEN.")
@@ -248,7 +253,11 @@ fn lifecycle_request(
             .unwrap_or(body);
         return Err(user_error(format!("{url} returned {status}: {message}")));
     }
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
     serde_json::from_str(&body)
+        .map(Some)
         .map_err(|e| user_error_with_message(format!("failed to parse {url} response"), e))
 }
 
