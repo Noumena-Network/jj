@@ -191,5 +191,6 @@ debug = "line-tables-only"
 opt-level = 3
 
 [profile.release]
-strip = "debuginfo"
+strip = "symbols"
 codegen-units = 1
+lto = "thin"
