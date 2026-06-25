@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to dry-run; must be reachable from main. Ignored when publish=true and tag is set.'
+        required: false
+        default: main
+        type: string
+      tag:
+        description: 'Existing release tag to publish, for example v0.1.0. Required when publish=true.'
+        required: false
+        type: string
+      publish:
+        description: 'Publish the GitHub release. Leave false for build-only dry-run.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && (inputs.publish && inputs.tag || inputs.ref) || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      publish: ${{ steps.release.outputs.publish }}
+      checkout_ref: ${{ steps.release.outputs.checkout_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.publish && inputs.tag || inputs.ref) || github.ref }}
+      - name: Validate tag, version, changelog, and main ancestry
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish="false"
+          tag=""
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            publish="true"
+            tag="${GITHUB_REF_NAME}"
+          elif [[ "${{ inputs.publish }}" == "true" ]]; then
+            publish="true"
+            tag="${{ inputs.tag }}"
+            if [[ -z "$tag" ]]; then
+              echo "workflow_dispatch publish=true requires an existing release tag" >&2
+              exit 1
+            fi
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Release tags must look like vX.Y.Z or vX.Y.Z-prerelease; got: $tag" >&2
+              exit 1
+            fi
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            git checkout --detach "refs/tags/${tag}"
+          fi
+          package_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [[ "$publish" == "true" ]]; then
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Release tags must look like vX.Y.Z or vX.Y.Z-prerelease; got: $tag" >&2
+              exit 1
+            fi
+            version="${tag#v}"
+            if [[ "$package_version" != "$version" ]]; then
+              echo "Tag $tag does not match Cargo workspace version $package_version" >&2
+              exit 1
+            fi
+          else
+            version="$package_version"
+            tag="dry-run-v${version}-${GITHUB_RUN_ID}"
+          fi
+          git fetch origin main --tags
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Release ref must point to a commit reachable from origin/main" >&2
+            exit 1
+          fi
+          if ! grep -Fq "## [$version] - " CHANGELOG.md; then
+            echo "CHANGELOG.md must contain a released section for $version" >&2
+            exit 1
+          fi
+          checkout_ref="$(git rev-parse HEAD)"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "checkout_ref=$checkout_ref"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build / ${{ matrix.name }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-24.04
+            platform: linux-x64
+          - name: darwin-arm64
+            runner: macos-14
+            platform: darwin-arm64
+          - name: darwin-x64
+            runner: macos-15-intel
+            platform: darwin-x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+      - name: Build, smoke, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.preflight.outputs.version }}"
+          scripts/build.sh
+          scripts/smoke.sh dist/jj
+          scripts/package.sh "$version" "${{ matrix.platform }}" release-assets
+      - name: Generate artifact attestations
+        if: ${{ needs.preflight.outputs.publish == 'true' }}
+        uses: actions/attest@v4
+        with:
+          subject-path: release-assets/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.name }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  dry-run-summary:
+    name: Release dry-run summary
+    needs: [preflight, build]
+    if: ${{ needs.preflight.outputs.publish != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "Release dry-run passed for version ${{ needs.preflight.outputs.version }} at ref ${{ needs.preflight.outputs.checkout_ref }}."
+
+  publish:
+    name: Publish GitHub release
+    needs: [preflight, build]
+    if: ${{ needs.preflight.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          path: release-assets
+          merge-multiple: true
+      - name: Extract release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.preflight.outputs.version }}"
+          awk -v version="$version" '
+            $0 ~ "^## \[" version "\] - " { in_section=1; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.preflight.outputs.tag }}" \
+            --title "${{ needs.preflight.outputs.tag }}" \
+            --notes-file release-notes.md \
+            release-assets/*
